@@ -1,33 +1,36 @@
-# ===🔐 Enhanced Secure Chat Server with File Transfer Support===
+# railway_server.py
+# Modified version of your server for Railway deployment
+
 import socket
 import threading
 import json
 import hashlib
 import time
+import os
 from datetime import datetime, timedelta
 
-# Server configuration
-HOST = '0.0.0.0'
-PORT = 5000
+# Get port from environment (Railway sets this)
+PORT = int(os.environ.get("PORT", 5000))
+HOST = '0.0.0.0'  # Must be 0.0.0.0 for Railway
+
 MAX_CLIENTS = 50
-BUFFER_SIZE = 16384  # Increased for file transfers
+BUFFER_SIZE = 16384
 
 # Client storage
-clients = {}  # socket -> client_info
-client_usernames = {}  # socket -> username
-username_to_socket = {}  # username -> socket
+clients = {}
+client_usernames = {}
+username_to_socket = {}
 
-# User authentication (simple in-memory storage)
-# In production, use a proper database with hashed passwords
-user_database = {}  # username -> {"password_hash": str, "public_key": str, "last_login": datetime}
+# User authentication
+user_database = {}
 
 # Rate limiting
-connection_attempts = {}  # ip -> {"count": int, "last_attempt": datetime}
+connection_attempts = {}
 MAX_ATTEMPTS_PER_IP = 5
 RATE_LIMIT_WINDOW = timedelta(minutes=15)
 
 def hash_password(password):
-    """Simple password hashing (use bcrypt in production)"""
+    """Simple password hashing"""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def check_rate_limit(client_ip):
@@ -37,16 +40,13 @@ def check_rate_limit(client_ip):
     if client_ip in connection_attempts:
         attempt_info = connection_attempts[client_ip]
         
-        # Reset counter if window expired
         if now - attempt_info["last_attempt"] > RATE_LIMIT_WINDOW:
             connection_attempts[client_ip] = {"count": 1, "last_attempt": now}
             return True
         
-        # Check if too many attempts
         if attempt_info["count"] >= MAX_ATTEMPTS_PER_IP:
             return False
         
-        # Increment counter
         connection_attempts[client_ip]["count"] += 1
         connection_attempts[client_ip]["last_attempt"] = now
         return True
@@ -59,27 +59,22 @@ def authenticate_user(username, password, public_key):
     if not username or not password or not public_key:
         return {"status": "fail", "message": "Missing credentials"}
     
-    # Validate username
     if len(username) > 50 or not username.replace('_', '').replace('-', '').isalnum():
         return {"status": "fail", "message": "Invalid username format"}
     
-    # Validate password length
     if len(password) > 128:
         return {"status": "fail", "message": "Password too long"}
     
     password_hash = hash_password(password)
     
     if username in user_database:
-        # Existing user - verify password
         if user_database[username]["password_hash"] == password_hash:
-            # Update public key and last login
             user_database[username]["public_key"] = public_key
             user_database[username]["last_login"] = datetime.now()
             return {"status": "success", "message": "Welcome back!"}
         else:
             return {"status": "fail", "message": "Invalid password"}
     else:
-        # New user - create account
         user_database[username] = {
             "password_hash": password_hash,
             "public_key": public_key,
@@ -104,7 +99,6 @@ def broadcast_peer_list():
     
     message_data = json.dumps(peer_message).encode()
     
-    # Send to all authenticated clients
     disconnected_clients = []
     for client_socket in client_usernames.keys():
         try:
@@ -112,7 +106,6 @@ def broadcast_peer_list():
         except:
             disconnected_clients.append(client_socket)
     
-    # Clean up disconnected clients
     for client_socket in disconnected_clients:
         remove_client(client_socket)
 
@@ -133,8 +126,7 @@ def remove_client(client_socket):
         
         client_socket.close()
         
-        # Update peer list for remaining clients
-        if client_usernames:  # Only if there are still clients
+        if client_usernames:
             broadcast_peer_list()
             
     except Exception as e:
@@ -144,7 +136,6 @@ def handle_client(client_socket, client_address):
     """Handle individual client connection"""
     print(f"[+] New connection from {client_address}")
     
-    # Check rate limiting
     client_ip = client_address[0]
     if not check_rate_limit(client_ip):
         print(f"[!] Rate limit exceeded for {client_ip}")
@@ -166,8 +157,7 @@ def handle_client(client_socket, client_address):
     }
     
     try:
-        # Wait for authentication
-        client_socket.settimeout(30)  # 30 second timeout for auth
+        client_socket.settimeout(30)
         auth_data = client_socket.recv(BUFFER_SIZE)
         
         if not auth_data:
@@ -180,17 +170,14 @@ def handle_client(client_socket, client_address):
             password = auth_payload.get("auth", "")
             public_key = auth_payload.get("public_key", "")
             
-            # Authenticate
             auth_result = authenticate_user(username, password, public_key)
             
-            # Send authentication result
             client_socket.sendall(json.dumps({
                 "type": "auth_result",
                 **auth_result
             }).encode())
             
             if auth_result["status"] in ["success", "new_user"]:
-                # Authentication successful
                 clients[client_socket]["authenticated"] = True
                 clients[client_socket]["username"] = username
                 client_usernames[client_socket] = username
@@ -198,13 +185,8 @@ def handle_client(client_socket, client_address):
                 
                 print(f"[+] User {username} authenticated from {client_address}")
                 
-                # Remove authentication timeout
                 client_socket.settimeout(None)
-                
-                # Send updated peer list to all clients
                 broadcast_peer_list()
-                
-                # Handle messages
                 handle_authenticated_client(client_socket, username)
             else:
                 print(f"[!] Authentication failed for {client_address}: {auth_result['message']}")
@@ -264,17 +246,14 @@ def route_message(sender_socket, sender_username, message):
         print(f"[!] No recipient specified in message from {sender_username}")
         return
     
-    # Find recipient socket
     recipient_socket = username_to_socket.get(recipient)
     if not recipient_socket:
         print(f"[!] Recipient {recipient} not found for message from {sender_username}")
         return
     
     try:
-        # Forward the message to recipient
         recipient_socket.sendall(json.dumps(message).encode())
         
-        # Log different message types
         if msg_type == "message":
             print(f"[MSG] {sender_username} -> {recipient}: [encrypted message]")
         elif msg_type == "key_exchange":
@@ -293,7 +272,6 @@ def route_message(sender_socket, sender_username, message):
             
     except Exception as e:
         print(f"[!] Failed to forward message from {sender_username} to {recipient}: {e}")
-        # Remove disconnected recipient
         if recipient_socket in client_usernames:
             remove_client(recipient_socket)
 
@@ -311,7 +289,7 @@ def cleanup_old_rate_limits():
             for ip in expired_ips:
                 del connection_attempts[ip]
             
-            time.sleep(300)  # Clean up every 5 minutes
+            time.sleep(300)
         except Exception as e:
             print(f"[!] Cleanup error: {e}")
             time.sleep(60)
@@ -320,7 +298,7 @@ def print_server_stats():
     """Print server statistics periodically"""
     while True:
         try:
-            time.sleep(60)  # Every minute
+            time.sleep(60)
             connected_users = len(client_usernames)
             total_users = len(user_database)
             rate_limited_ips = len(connection_attempts)
@@ -349,7 +327,6 @@ def start_server():
         print(f"[*] Server started at {datetime.now()}")
         print("-" * 50)
         
-        # Start background threads
         threading.Thread(target=cleanup_old_rate_limits, daemon=True).start()
         threading.Thread(target=print_server_stats, daemon=True).start()
         
@@ -357,7 +334,6 @@ def start_server():
             try:
                 client_socket, client_address = server_socket.accept()
                 
-                # Check if we're at capacity
                 if len(clients) >= MAX_CLIENTS:
                     print(f"[!] Server at capacity, rejecting {client_address}")
                     try:
@@ -371,7 +347,6 @@ def start_server():
                         pass
                     continue
                 
-                # Start client handler thread
                 client_thread = threading.Thread(
                     target=handle_client, 
                     args=(client_socket, client_address),
@@ -390,7 +365,6 @@ def start_server():
     finally:
         print("[*] Closing server...")
         
-        # Close all client connections
         for client_socket in list(clients.keys()):
             try:
                 client_socket.close()
