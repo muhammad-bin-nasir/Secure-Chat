@@ -1,4 +1,4 @@
-# ===🔐 Encrypted Chat - Updated for Secure Server===
+# ===🔐 Encrypted Chat with File Sharing - Updated for Secure Server===
 import time
 import sys
 import threading
@@ -6,12 +6,15 @@ import socket
 import json
 import base64
 import hashlib
+import os
+from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
-    QLineEdit, QPushButton, QLabel, QListWidget, QComboBox, QMessageBox, QInputDialog
+    QLineEdit, QPushButton, QLabel, QListWidget, QComboBox, QMessageBox, 
+    QInputDialog, QFileDialog, QProgressBar, QTabWidget, QSplitter
 )
 
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from Crypto.Cipher import AES, PKCS1_OAEP
 from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
@@ -35,6 +38,10 @@ peer_public_keys = {}   # username -> public key string
 peer_key_hashes = {}    # username -> SHA256 hash
 aes_session_keys = {}   # username -> AES session key
 
+# File transfer constants
+CHUNK_SIZE = 8192  # 8KB chunks
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB limit
+
 # ===🔐 Crypto Helpers===
 def sha256_digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -42,6 +49,16 @@ def sha256_digest(data):
 def aes_encrypt(key, message):
     cipher = AES.new(key, AES.MODE_GCM)
     ciphertext, tag = cipher.encrypt_and_digest(message.encode())
+    return {
+        "ciphertext": base64.b64encode(ciphertext).decode(),
+        "nonce": base64.b64encode(cipher.nonce).decode(),
+        "tag": base64.b64encode(tag).decode()
+    }
+
+def aes_encrypt_bytes(key, data):
+    """Encrypt binary data (for files)"""
+    cipher = AES.new(key, AES.MODE_GCM)
+    ciphertext, tag = cipher.encrypt_and_digest(data)
     return {
         "ciphertext": base64.b64encode(ciphertext).decode(),
         "nonce": base64.b64encode(cipher.nonce).decode(),
@@ -58,6 +75,17 @@ def aes_decrypt(key, enc_data):
     except:
         return "[Decryption failed]"
 
+def aes_decrypt_bytes(key, enc_data):
+    """Decrypt binary data (for files)"""
+    try:
+        nonce = base64.b64decode(enc_data["nonce"])
+        ciphertext = base64.b64decode(enc_data["ciphertext"])
+        tag = base64.b64decode(enc_data["tag"])
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        return cipher.decrypt_and_verify(ciphertext, tag)
+    except:
+        return None
+
 def rsa_encrypt(pub_key_str, secret_key):
     peer_key = RSA.import_key(pub_key_str)
     cipher_rsa = PKCS1_OAEP.new(peer_key)
@@ -71,6 +99,90 @@ def rsa_decrypt(encrypted_key):
 class Communicator(QObject):
     message_received = pyqtSignal(str, str)
     peer_list_updated = pyqtSignal(list)
+    file_transfer_progress = pyqtSignal(str, int, int)  # filename, current, total
+    file_received = pyqtSignal(str, str, str)  # sender, filename, filepath
+
+# ===📁 File Transfer Thread===
+class FileTransferThread(QThread):
+    progress_updated = pyqtSignal(int, int)  # current, total
+    transfer_completed = pyqtSignal(bool, str)  # success, message
+    
+    def __init__(self, socket_obj, session_key, file_path, recipient, username, is_p2p=False):
+        super().__init__()
+        self.socket_obj = socket_obj
+        self.session_key = session_key
+        self.file_path = file_path
+        self.recipient = recipient
+        self.username = username
+        self.is_p2p = is_p2p
+        
+    def run(self):
+        try:
+            file_size = os.path.getsize(self.file_path)
+            filename = os.path.basename(self.file_path)
+            
+            if file_size > MAX_FILE_SIZE:
+                self.transfer_completed.emit(False, f"File too large (max {MAX_FILE_SIZE//1024//1024}MB)")
+                return
+            
+            # Send file header
+            file_header = {
+                "type": "file_header",
+                "to": self.recipient,
+                "from": self.username,
+                "filename": filename,
+                "filesize": file_size,
+                "file_hash": self.calculate_file_hash(self.file_path)
+            }
+            
+            self.socket_obj.sendall(json.dumps(file_header).encode())
+            
+            # Send file in chunks
+            bytes_sent = 0
+            with open(self.file_path, 'rb') as f:
+                while bytes_sent < file_size:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                        
+                    # Encrypt chunk
+                    encrypted_chunk = aes_encrypt_bytes(self.session_key, chunk)
+                    
+                    chunk_data = {
+                        "type": "file_chunk",
+                        "to": self.recipient,
+                        "from": self.username,
+                        "chunk_data": encrypted_chunk
+                    }
+                    
+                    self.socket_obj.sendall(json.dumps(chunk_data).encode())
+                    bytes_sent += len(chunk)
+                    self.progress_updated.emit(bytes_sent, file_size)
+                    
+                    # Small delay to prevent overwhelming
+                    time.sleep(0.001)
+            
+            # Send file end marker
+            file_end = {
+                "type": "file_end",
+                "to": self.recipient,
+                "from": self.username,
+                "filename": filename
+            }
+            
+            self.socket_obj.sendall(json.dumps(file_end).encode())
+            self.transfer_completed.emit(True, f"File '{filename}' sent successfully")
+            
+        except Exception as e:
+            self.transfer_completed.emit(False, f"Transfer failed: {str(e)}")
+    
+    def calculate_file_hash(self, filepath):
+        """Calculate SHA256 hash of file"""
+        hash_sha256 = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_sha256.update(chunk)
+        return hash_sha256.hexdigest()
 
 # ===📡 Chat Client Class===
 class ChatClient(QWidget):
@@ -78,12 +190,14 @@ class ChatClient(QWidget):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🔐 Encrypted Chat - Secure Edition")
-        self.resize(800, 600)
+        self.setWindowTitle("🔐 Encrypted Chat with File Sharing")
+        self.resize(1000, 700)
         self.message_signal.connect(self.display_system_message)
         self.comm = Communicator()
         self.comm.message_received.connect(self.display_message)
         self.comm.peer_list_updated.connect(self.update_peer_list)
+        self.comm.file_transfer_progress.connect(self.update_file_progress)
+        self.comm.file_received.connect(self.handle_file_received)
 
         # Server mode variables
         self.server_sock = None
@@ -94,6 +208,12 @@ class ChatClient(QWidget):
         self.p2p_connected = False
         self.connection_lock = threading.Lock()
         
+        # File transfer variables
+        self.incoming_files = {}  # filename -> {"sender": str, "size": int, "received": int, "data": bytes, "hash": str}
+        self.file_transfer_threads = []
+        self.downloads_dir = Path.home() / "Downloads" / "SecureChat"
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        
         self.username = ""
         self.peers = []
         self.p2p_mode = False
@@ -103,13 +223,14 @@ class ChatClient(QWidget):
         self.init_ui()
 
     def init_ui(self):
-        layout = QVBoxLayout()
-        top_bar = QHBoxLayout()
-
+        main_layout = QVBoxLayout()
+        
+        # Connection bar
+        conn_layout = QHBoxLayout()
         self.username_input = QLineEdit()
         self.username_input.setPlaceholderText("Your username")
         self.server_ip_input = QLineEdit("127.0.0.1")
-        self.remote_port_input = QLineEdit("5000")  # Changed default to match server
+        self.remote_port_input = QLineEdit("5000")
         self.local_port_input = QLineEdit("6001")
         self.remote_port_input.setFixedWidth(60)
         self.local_port_input.setFixedWidth(60)
@@ -117,46 +238,208 @@ class ChatClient(QWidget):
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self.choose_connection_type)
 
-        top_bar.addWidget(QLabel("Connect Port:"))
-        top_bar.addWidget(self.remote_port_input)
-        top_bar.addWidget(QLabel("Listen Port:"))
-        top_bar.addWidget(self.local_port_input)
-        top_bar.addWidget(QLabel("Username:"))
-        top_bar.addWidget(self.username_input)
-        top_bar.addWidget(QLabel("Server/Peer IP:"))
-        top_bar.addWidget(self.server_ip_input)
-        top_bar.addWidget(self.connect_btn)
+        conn_layout.addWidget(QLabel("Connect Port:"))
+        conn_layout.addWidget(self.remote_port_input)
+        conn_layout.addWidget(QLabel("Listen Port:"))
+        conn_layout.addWidget(self.local_port_input)
+        conn_layout.addWidget(QLabel("Username:"))
+        conn_layout.addWidget(self.username_input)
+        conn_layout.addWidget(QLabel("Server/Peer IP:"))
+        conn_layout.addWidget(self.server_ip_input)
+        conn_layout.addWidget(self.connect_btn)
 
-        layout.addLayout(top_bar)
+        main_layout.addLayout(conn_layout)
 
+        # Main content area with tabs
+        self.tab_widget = QTabWidget()
+        
+        # Chat tab
+        chat_tab = QWidget()
+        chat_layout = QVBoxLayout()
+        
+        # Chat display and peers
+        content_splitter = QSplitter(Qt.Horizontal)
+        
+        # Chat area
+        chat_widget = QWidget()
+        chat_widget_layout = QVBoxLayout()
+        
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
-        layout.addWidget(self.chat_display)
-
-        mid_bar = QHBoxLayout()
-        self.peers_list = QListWidget()
-        self.peers_list.setFixedWidth(150)
-        mid_bar.addWidget(self.peers_list)
-
-        right_side = QVBoxLayout()
+        chat_widget_layout.addWidget(self.chat_display)
+        
+        # Message input area
+        msg_layout = QHBoxLayout()
         self.encryption_select = QComboBox()
         self.encryption_select.addItems(["AES (with RSA)"])
         self.message_input = QLineEdit()
         self.message_input.returnPressed.connect(self.send_message)
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send_message)
+        self.send_file_btn = QPushButton("📁 Send File")
+        self.send_file_btn.clicked.connect(self.send_file)
 
-        right_side.addWidget(QLabel("Encryption Method:"))
-        right_side.addWidget(self.encryption_select)
-        right_side.addWidget(self.message_input)
-        right_side.addWidget(self.send_btn)
-        mid_bar.addLayout(right_side)
-        layout.addLayout(mid_bar)
-
-        self.setLayout(layout)
+        msg_layout.addWidget(QLabel("Encryption:"))
+        msg_layout.addWidget(self.encryption_select)
+        msg_layout.addWidget(self.message_input)
+        msg_layout.addWidget(self.send_btn)
+        msg_layout.addWidget(self.send_file_btn)
+        
+        chat_widget_layout.addLayout(msg_layout)
+        chat_widget.setLayout(chat_widget_layout)
+        content_splitter.addWidget(chat_widget)
+        
+        # Peers list
+        peers_widget = QWidget()
+        peers_layout = QVBoxLayout()
+        peers_layout.addWidget(QLabel("Connected Peers:"))
+        self.peers_list = QListWidget()
+        self.peers_list.setFixedWidth(200)
+        peers_layout.addWidget(self.peers_list)
+        peers_widget.setLayout(peers_layout)
+        content_splitter.addWidget(peers_widget)
+        
+        content_splitter.setSizes([800, 200])
+        
+        chat_layout.addWidget(content_splitter)
+        chat_tab.setLayout(chat_layout)
+        self.tab_widget.addTab(chat_tab, "💬 Chat")
+        
+        # File transfers tab
+        files_tab = QWidget()
+        files_layout = QVBoxLayout()
+        
+        files_layout.addWidget(QLabel("File Transfer Progress:"))
+        self.file_progress_list = QTextEdit()
+        self.file_progress_list.setReadOnly(True)
+        self.file_progress_list.setMaximumHeight(150)
+        files_layout.addWidget(self.file_progress_list)
+        
+        files_layout.addWidget(QLabel("Received Files:"))
+        self.received_files_list = QListWidget()
+        self.received_files_list.itemDoubleClicked.connect(self.open_received_file)
+        files_layout.addWidget(self.received_files_list)
+        
+        # Downloads directory info
+        downloads_info = QLabel(f"📁 Downloads saved to: {self.downloads_dir}")
+        downloads_info.setStyleSheet("color: gray; font-size: 10px;")
+        files_layout.addWidget(downloads_info)
+        
+        files_tab.setLayout(files_layout)
+        self.tab_widget.addTab(files_tab, "📁 Files")
+        
+        main_layout.addWidget(self.tab_widget)
+        self.setLayout(main_layout)
 
     def display_system_message(self, message):
         self.chat_display.append(message)
+
+    def send_file(self):
+        """Handle file sending"""
+        selected = self.peers_list.selectedItems()
+        if not selected:
+            self.message_signal.emit("[!] Select a peer first!")
+            return
+
+        peer_label = selected[0].text()
+        peer = peer_label.split(" [")[0]
+
+        # Check connection
+        if not self.p2p_mode and not self.server_sock:
+            self.message_signal.emit("[!] Not connected to server!")
+            return
+        elif self.p2p_mode and not self.p2p_connected:
+            self.message_signal.emit("[!] Not connected to peer!")
+            return
+
+        # Check if we have session key
+        if peer not in aes_session_keys:
+            self.message_signal.emit(f"[!] No session key for {peer}. Send a message first!")
+            return
+
+        # Select file
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Select File to Send", 
+            "", 
+            "All Files (*)"
+        )
+        
+        if not file_path:
+            return
+            
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        if file_size > MAX_FILE_SIZE:
+            self.message_signal.emit(f"[!] File too large (max {MAX_FILE_SIZE//1024//1024}MB)")
+            return
+        
+        filename = os.path.basename(file_path)
+        self.message_signal.emit(f"[~] Sending file '{filename}' ({file_size} bytes) to {peer}...")
+        
+        # Start file transfer thread
+        socket_obj = self.p2p_socket if self.p2p_mode else self.server_sock
+        transfer_thread = FileTransferThread(
+            socket_obj, 
+            aes_session_keys[peer], 
+            file_path, 
+            peer, 
+            self.username, 
+            self.p2p_mode
+        )
+        
+        transfer_thread.progress_updated.connect(
+            lambda current, total: self.update_transfer_progress(filename, current, total)
+        )
+        transfer_thread.transfer_completed.connect(
+            lambda success, msg: self.file_transfer_completed(filename, success, msg)
+        )
+        
+        self.file_transfer_threads.append(transfer_thread)
+        transfer_thread.start()
+
+    def update_transfer_progress(self, filename, current, total):
+        """Update file transfer progress"""
+        progress = (current / total) * 100 if total > 0 else 0
+        self.file_progress_list.append(f"📤 {filename}: {progress:.1f}% ({current}/{total} bytes)")
+
+    def file_transfer_completed(self, filename, success, message):
+        """Handle file transfer completion"""
+        if success:
+            self.file_progress_list.append(f"✅ {message}")
+            self.message_signal.emit(f"[+] {message}")
+        else:
+            self.file_progress_list.append(f"❌ {message}")
+            self.message_signal.emit(f"[!] {message}")
+
+    def update_file_progress(self, filename, current, total):
+        """Update incoming file progress"""
+        progress = (current / total) * 100 if total > 0 else 0
+        self.file_progress_list.append(f"📥 {filename}: {progress:.1f}% ({current}/{total} bytes)")
+
+    def handle_file_received(self, sender, filename, filepath):
+        """Handle completed file reception"""
+        self.received_files_list.addItem(f"{filename} (from {sender})")
+        self.file_progress_list.append(f"✅ File '{filename}' received from {sender}")
+        self.message_signal.emit(f"[+] File '{filename}' received from {sender}")
+        
+        # Switch to files tab to show the received file
+        self.tab_widget.setCurrentIndex(1)
+
+    def open_received_file(self, item):
+        """Open received file location"""
+        import subprocess
+        import platform
+        
+        try:
+            if platform.system() == "Windows":
+                os.startfile(self.downloads_dir)
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.run(["open", self.downloads_dir])
+            else:  # Linux
+                subprocess.run(["xdg-open", self.downloads_dir])
+        except:
+            self.message_signal.emit(f"[i] Files are saved in: {self.downloads_dir}")
 
     # ===🔌 Connection Mode===
     def choose_connection_type(self):
@@ -383,7 +666,7 @@ class ChatClient(QWidget):
         """Handle messages from server"""
         while True:
             try:
-                data = self.server_sock.recv(8192)
+                data = self.server_sock.recv(16384)  # Increased buffer for file transfers
                 if not data:
                     self.message_signal.emit("[!] Server disconnected")
                     break
@@ -420,7 +703,7 @@ class ChatClient(QWidget):
             try:
                 # Use a timeout to periodically check connection status
                 self.p2p_socket.settimeout(1.0)
-                data = self.p2p_socket.recv(8192)
+                data = self.p2p_socket.recv(16384)  # Increased buffer for file transfers
                 
                 if not data:
                     self.message_signal.emit("[i] Peer disconnected (no data)")
@@ -518,8 +801,102 @@ class ChatClient(QWidget):
                 peer_list.append(f"{uname} [{peer_key_hashes[uname][:6]}...]")
             self.comm.peer_list_updated.emit(peer_list)
         
+        elif msg_type == "file_header":
+            # Handle incoming file header
+            sender = payload["from"]
+            filename = payload["filename"]
+            filesize = payload["filesize"]
+            file_hash = payload["file_hash"]
+            
+            # Initialize file reception
+            self.incoming_files[filename] = {
+                "sender": sender,
+                "size": filesize,
+                "received": 0,
+                "data": b"",
+                "hash": file_hash
+            }
+            
+            self.message_signal.emit(f"[~] Receiving file '{filename}' ({filesize} bytes) from {sender}")
+            self.comm.file_transfer_progress.emit(filename, 0, filesize)
+        
+        elif msg_type == "file_chunk":
+            # Handle incoming file chunk
+            sender = payload["from"]
+            chunk_data = payload["chunk_data"]
+            
+            # Find the file being received (we need to match by sender)
+            filename = None
+            for fname, finfo in self.incoming_files.items():
+                if finfo["sender"] == sender and finfo["received"] < finfo["size"]:
+                    filename = fname
+                    break
+            
+            if filename and filename in self.incoming_files:
+                # Decrypt chunk
+                if sender in aes_session_keys:
+                    decrypted_chunk = aes_decrypt_bytes(aes_session_keys[sender], chunk_data)
+                    if decrypted_chunk:
+                        self.incoming_files[filename]["data"] += decrypted_chunk
+                        self.incoming_files[filename]["received"] += len(decrypted_chunk)
+                        
+                        # Update progress
+                        current = self.incoming_files[filename]["received"]
+                        total = self.incoming_files[filename]["size"]
+                        self.comm.file_transfer_progress.emit(filename, current, total)
+                    else:
+                        self.message_signal.emit(f"[!] Failed to decrypt file chunk from {sender}")
+                else:
+                    self.message_signal.emit(f"[!] No session key for {sender}")
+        
+        elif msg_type == "file_end":
+            # Handle file transfer completion
+            sender = payload["from"]
+            filename = payload["filename"]
+            
+            if filename in self.incoming_files:
+                file_info = self.incoming_files[filename]
+                
+                # Verify file integrity
+                received_hash = hashlib.sha256(file_info["data"]).hexdigest()
+                if received_hash == file_info["hash"]:
+                    # Save file
+                    safe_filename = self.sanitize_filename(filename)
+                    file_path = self.downloads_dir / safe_filename
+                    
+                    # Handle duplicate filenames
+                    counter = 1
+                    original_path = file_path
+                    while file_path.exists():
+                        name, ext = os.path.splitext(safe_filename)
+                        file_path = self.downloads_dir / f"{name}_{counter}{ext}"
+                        counter += 1
+                    
+                    try:
+                        with open(file_path, 'wb') as f:
+                            f.write(file_info["data"])
+                        
+                        self.comm.file_received.emit(sender, filename, str(file_path))
+                    except Exception as e:
+                        self.message_signal.emit(f"[!] Failed to save file: {e}")
+                else:
+                    self.message_signal.emit(f"[!] File integrity check failed for '{filename}'")
+                
+                # Clean up
+                del self.incoming_files[filename]
+        
         else:
             self.message_signal.emit(f"[?] Unknown message type: {msg_type}")
+
+    def sanitize_filename(self, filename):
+        """Sanitize filename for safe saving"""
+        # Remove/replace dangerous characters
+        import re
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        filename = filename.strip('. ')
+        if not filename:
+            filename = "received_file"
+        return filename
 
     def update_peer_list(self, peers):
         self.peers = peers
